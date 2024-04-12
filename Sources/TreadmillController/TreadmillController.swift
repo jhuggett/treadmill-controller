@@ -4,8 +4,6 @@
 import CoreBluetooth
 import Foundation
 
-let commandQueue = DispatchQueue(label: "commandQueue")
-
 public protocol TreadmillControllerDelegate {
   func treadmillController(
     _ treadmillController: TreadmillController, readyToScanForTreadmills ready: Bool)
@@ -53,26 +51,56 @@ public class TreadmillController: NSObject {
     return cmd
   }
 
-  func sendCommand(_ command: [UInt8]) {
-    guard let peripheral = self.treadmillPeripheral else {
-      print("No peripheral found")
+  var commandQueue: [[UInt8]] = []
+
+  var isProcessingCommandQueue = false
+
+  func processCommandQueue() {
+    if isProcessingCommandQueue {
+      print("Already processing command queue")
       return
     }
+    print(
+      "Processing command queue", "queue size", commandQueue.count, "isProcessingCommandQueue",
+      isProcessingCommandQueue)
 
-    guard let treadmillCommandCharacteristic = self.treadmillCommandCharacteristic
-    else {
-      print("No command characteristic found")
-      return
-    }
+    isProcessingCommandQueue = true
+    while commandQueue.count > 0 {
+      let command = commandQueue.removeFirst()
 
-    commandQueue.sync {
+      guard let peripheral = self.treadmillPeripheral else {
+        print("No peripheral found")
+        return
+      }
+
+      guard let treadmillCommandCharacteristic = self.treadmillCommandCharacteristic
+      else {
+        print("No command characteristic found")
+        return
+      }
+
+      print("Sending command", command, "to treadmill", "queue size", commandQueue.count)
+
       peripheral.writeValue(
         Data(applyChecksum(command)),
         for: treadmillCommandCharacteristic,
         type: .withoutResponse)
 
-      usleep(700)
+      sleep(1)  // usleep(700)
     }
+    isProcessingCommandQueue = false
+    print(
+      "Finished processing command queue",
+      "queue size",
+      commandQueue.count,
+      "isProcessingCommandQueue",
+      isProcessingCommandQueue
+    )
+  }
+
+  func sendCommand(_ command: [UInt8]) {
+    commandQueue.append(command)
+    processCommandQueue()
   }
 
   public func startBelt() {
