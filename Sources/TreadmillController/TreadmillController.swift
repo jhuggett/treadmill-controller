@@ -19,12 +19,42 @@ public protocol TreadmillControllerDelegate {
   func treadmillController(
     _ treadmillController: TreadmillController, didDisconnectFromTreadmill peripheral: CBPeripheral,
     error: Error)
+
+  func treadmillController(
+    _ treadmillController: TreadmillController, beltStarted stats: TreadmillStats)
+  func treadmillController(
+    _ treadmillController: TreadmillController, beltStopped stats: TreadmillStats)
+  func treadmillController(
+    _ treadmillController: TreadmillController, beltSpeedChanged stats: TreadmillStats)
+  func treadmillController(
+    _ treadmillController: TreadmillController, modeChanged stats: TreadmillStats)
 }
+
+protocol ModelTranslator {
+  func speedToMilesPerHour(speed: UInt8) -> Double
+  func speedFromMilesPerHour(speed: Double) -> UInt8
+}
+
+// for the KS-ST-A1P
+class KSSTA1PModelTranslator: ModelTranslator {
+  func speedToMilesPerHour(speed: UInt8) -> Double {
+    return Double(speed) / 16
+  }
+
+  func speedFromMilesPerHour(speed: Double) -> UInt8 {
+    return UInt8(speed * 16)
+  }
+}
+
+// <- Add your's here Chris
+
+let supportedModels: [String: ModelTranslator] = ["KS-ST-A1P": KSSTA1PModelTranslator()]
 
 public class TreadmillController: NSObject {
   var centralManager: CBCentralManager!
   var discoveredPeripherals = [CBPeripheral]()
   var treadmillPeripheral: CBPeripheral?
+  var treadmillModelTranslator: ModelTranslator?
 
   var treadmillCommandCharacteristic: CBCharacteristic?
   var treadmillStatsCharacteristic: CBCharacteristic?
@@ -56,51 +86,44 @@ public class TreadmillController: NSObject {
   var isProcessingCommandQueue = false
 
   func processCommandQueue() {
-    if isProcessingCommandQueue {
-      print("Already processing command queue")
+    self.isProcessingCommandQueue = true
+
+    if commandQueue.count == 0 {
+      self.isProcessingCommandQueue = false
       return
     }
-    print(
-      "Processing command queue", "queue size", commandQueue.count, "isProcessingCommandQueue",
-      isProcessingCommandQueue)
 
-    isProcessingCommandQueue = true
-    while commandQueue.count > 0 {
-      let command = commandQueue.removeFirst()
+    let command = commandQueue.removeFirst()
 
-      guard let peripheral = self.treadmillPeripheral else {
-        print("No peripheral found")
-        return
-      }
-
-      guard let treadmillCommandCharacteristic = self.treadmillCommandCharacteristic
-      else {
-        print("No command characteristic found")
-        return
-      }
-
-      print("Sending command", command, "to treadmill", "queue size", commandQueue.count)
-
-      peripheral.writeValue(
-        Data(applyChecksum(command)),
-        for: treadmillCommandCharacteristic,
-        type: .withoutResponse)
-
-      sleep(1)  // usleep(700)
+    guard let peripheral = self.treadmillPeripheral else {
+      print("No peripheral found")
+      return
     }
-    isProcessingCommandQueue = false
-    print(
-      "Finished processing command queue",
-      "queue size",
-      commandQueue.count,
-      "isProcessingCommandQueue",
-      isProcessingCommandQueue
-    )
+
+    guard let treadmillCommandCharacteristic = self.treadmillCommandCharacteristic
+    else {
+      print("No command characteristic found")
+      return
+    }
+
+    peripheral.writeValue(
+      Data(applyChecksum(command)),
+      for: treadmillCommandCharacteristic,
+      type: .withoutResponse)
+
+    print("--><-- Sent command", command, "to treadmill", "going to sleep, current time:", Date())
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+      print("--><-- Woke up from sleep, current time:", Date())
+      self.processCommandQueue()
+    }
   }
 
   func sendCommand(_ command: [UInt8]) {
     commandQueue.append(command)
-    processCommandQueue()
+    if !isProcessingCommandQueue {
+      processCommandQueue()
+    }
   }
 
   public func startBelt() {
@@ -128,10 +151,47 @@ public class TreadmillController: NSObject {
     sendCommand([247, 162, 0, 0, 162, 253])
   }
 
-  public func setSpeed(_ speed: Int) {
+  public func setSpeed(_ speed: Double) {
     print("SETTING SPEED", speed)
 
-    sendCommand([247, 162, 1, UInt8(speed), 0xff, 253])
+    // pass this through a converter
+
+    let speedInt =
+      self.treadmillModelTranslator?.speedFromMilesPerHour(speed: min(max(0.5, speed), 6.0))
+
+    guard let speedInt = speedInt else {
+      print("Could not compute speed, ignoring command")
+      return
+    }
+
+    sendCommand([247, 162, 1, speedInt, 0xff, 253])
+  }
+
+  var timeBetweenStatsRequests = 5.0
+
+  public func stopRequestingStats() {
+    print("STOPPING REQUESTING STATS")
+
+    setStatsRequestInterval(0)
+  }
+
+  public func setStatsRequestInterval(_ interval: Double) {
+    print("SETTING STATS REQUEST INTERVAL", interval)
+
+    timeBetweenStatsRequests = interval
+  }
+
+  public func startRequestingStats() {
+    print("STARTING REQUESTING STATS")
+
+    self.requestStats()
+
+    if self.timeBetweenStatsRequests > 0 {
+      DispatchQueue.main.asyncAfter(deadline: .now() + self.timeBetweenStatsRequests) {
+        self.startRequestingStats()
+      }
+    }
+
   }
 
   public func startScanning() {
@@ -167,6 +227,47 @@ public class TreadmillController: NSObject {
     print("Connecting to peripheral", peripheral)
     centralManager.connect(peripheral, options: nil)
   }
+
+  var lastStats: TreadmillStats? = nil
+
+  func receivedStats(_ stats: [UInt8]) {
+    print("Received stats", stats)
+    let beltState = stats[2]
+    let beltSpeed = treadmillModelTranslator?.speedToMilesPerHour(speed: stats[3]) ?? 0
+    let beltMode = stats[4]
+    let currentRunningTime = threeBigEndianBytesToInt(Array(stats[5...7]))
+    let currentDistance = threeBigEndianBytesToInt(Array(stats[8...10]))
+    let currentSteps = threeBigEndianBytesToInt(Array(stats[11...13]))
+
+    let treadmillStats = TreadmillStats(
+      beltState: beltState,
+      beltSpeed: beltSpeed,
+      beltMode: BeltMode(rawValue: Int(beltMode))!,
+      currentRunningTime: currentRunningTime,
+      currentDistance: currentDistance,
+      currentSteps: currentSteps)
+
+    delegate?.treadmillController(self, didUpdateStats: treadmillStats)
+
+    if lastStats == nil || lastStats?.beltSpeed != treadmillStats.beltSpeed {
+      delegate?.treadmillController(self, beltSpeedChanged: treadmillStats)
+    }
+
+    if (lastStats == nil || lastStats?.beltSpeed == 0) && treadmillStats.beltSpeed > 0 {
+      delegate?.treadmillController(self, beltStarted: treadmillStats)
+    }
+
+    if lastStats != nil && lastStats!.beltSpeed > 0 && treadmillStats.beltSpeed == 0 {
+      delegate?.treadmillController(self, beltStopped: treadmillStats)
+    }
+
+    if lastStats == nil || lastStats?.beltMode != treadmillStats.beltMode {
+      delegate?.treadmillController(self, modeChanged: treadmillStats)
+    }
+
+    lastStats = treadmillStats
+  }
+
 }
 
 extension TreadmillController: CBCentralManagerDelegate {
@@ -192,8 +293,8 @@ extension TreadmillController: CBCentralManagerDelegate {
     print("Peripheral Discovered: \(peripheral)")
     print("Peripheral name: \(String(describing: peripheral.name))")
     print("Advertisement Data : \(advertisementData)")
-    if peripheral.name == "KS-ST-A1P" {
-      print("Found Treadmill")
+    if supportedModels.keys.contains(peripheral.name ?? "") {
+      print("Found Treadmill", peripheral.name ?? "")
       self.discoveredPeripherals.append(peripheral)
       print("Connecting to peripheral Treadmill")
 
@@ -212,6 +313,8 @@ extension TreadmillController: CBCentralManagerDelegate {
   public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
     self.treadmillPeripheral = peripheral
     print("Connected to peripheral", peripheral, treadmillPeripheral!)
+
+    self.treadmillModelTranslator = supportedModels[peripheral.name ?? ""]
 
     peripheral.delegate = self
     peripheral.discoverServices(nil)
@@ -267,32 +370,22 @@ extension TreadmillController: CBPeripheralDelegate {
       }
 
       let stats = [UInt8](value)
-      print("Stats", stats)
-
-      let beltState = stats[2]
-      let beltSpeed = stats[3]
-      let beltMode = stats[4]
-      let currentRunningTime = threeBigEndianBytesToInt(Array(stats[5...7]))
-      let currentDistance = threeBigEndianBytesToInt(Array(stats[8...10]))
-      let currentSteps = threeBigEndianBytesToInt(Array(stats[11...13]))
-
-      let treadmillStats = TreadmillStats(
-        beltState: beltState,
-        beltSpeed: beltSpeed,
-        beltMode: beltMode,
-        currentRunningTime: currentRunningTime,
-        currentDistance: currentDistance,
-        currentSteps: currentSteps)
-
-      delegate?.treadmillController(self, didUpdateStats: treadmillStats)
+      receivedStats(stats)
     }
   }
+
+}
+
+public enum BeltMode: Int, Encodable {
+  case Auto = 0
+  case Manual = 1
+  case Standby = 2
 }
 
 public struct TreadmillStats: Encodable {
   public let beltState: UInt8
-  public let beltSpeed: UInt8
-  public let beltMode: UInt8
+  public let beltSpeed: Double
+  public let beltMode: BeltMode
   public let currentRunningTime: Int
   public let currentDistance: Int
   public let currentSteps: Int
